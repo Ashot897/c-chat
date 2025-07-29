@@ -1,110 +1,155 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
-#define PORT        8080
+#pragma comment(lib, "Ws2_32.lib")
+
 #define MAX_CLIENTS 10
+#define BUF_SIZE 512
 
-int main()
-{
-	int server_fd;
-	int new_client;
-	int client_sockets[MAX_CLIENTS] = {0};
-	struct sockaddr_in address;
-	socklen_t addrlen = sizeof(address);
-	char buffer[4096];
-	fd_set readfds;
+SOCKET clients[MAX_CLIENTS];
+char clientNames[MAX_CLIENTS][32];
+int clientCount = 0;
+CRITICAL_SECTION cs;
 
-	server_fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (server_fd == 0)
-	{
-		perror("Socket failed");
-		exit(EXIT_FAILURE);
-	}
-	address.sin_family = AF_INET;
-	address.sin_addr.s_addr = INADDR_ANY;
-	address.sin_port = htons(PORT);
+unsigned __stdcall client_thread(void *param) {
+    SOCKET clientSock = (SOCKET)param;
+    int idx = -1;
+    char buf[BUF_SIZE];
+    int len;
 
-	bind(server_fd, (struct sockaddr *)&address, sizeof(address));
-	listen(server_fd, 5);
-	printf("Server started of port %d\n", PORT);
+    EnterCriticalSection(&cs);
+    for (int i = 0; i < clientCount; i++) {
+        if (clients[i] == clientSock) {
+            idx = i;
+            break;
+        }
+    }
+    LeaveCriticalSection(&cs);
 
-	while (1)
-	{
-		FD_ZERO(&readfds);
-		FD_SET(server_fd, &readfds);
-		int max_fd = server_fd;
-		for (int i = 0; i < MAX_CLIENTS; i++)
-		{
-			int fd = client_sockets[i];
-			if (fd > 0)
-			{
-				FD_SET(fd, &readfds);
-			}
-			if (fd > max_fd)
-				max_fd = fd;
-		}
-		select(max_fd + 1, &readfds, NULL, NULL, NULL);
-		if (FD_ISSET(server_fd, &readfds))
-		{
-			new_client = accept(server_fd, (struct sockaddr *)&address, &addrlen);
-			printf("New connection!\n Socket FD: %d\n IP: %s\n", new_client, inet_ntoa(address.sin_addr));
+    while (1) {
+        len = recv(clientSock, buf, BUF_SIZE - 1, 0);
+        if (len <= 0) break;
 
-			for (int i = 0; i < MAX_CLIENTS; i++)
-			{
-				if (client_sockets[i] == 0)
-				{
-					client_sockets[i] = new_client;
-					break;
-				}
-			}
-		}
-		for (int i = 0; i < MAX_CLIENTS; i++)
-		{
-			int fd = client_sockets[i];
-			if (FD_ISSET(fd, &readfds))
-			{
-				int val = read(fd, buffer, 4096);
-				if (val == 0)
-				{
-					getpeername(fd, (struct sockaddr *)&address, &addrlen);
-					printf("Client disconnetted. IP: %s\n", inet_ntoa(address.sin_addr));
-					close(fd);
-					client_sockets[i] = 0;
-				}
-				else
-				{
-					buffer[val] = '\0';
-					for (int j = 0; j < MAX_CLIENTS; j++)
-					{
-						if (client_sockets[j] != 0 && client_sockets[j] != fd)
-						{
-							send(client_sockets[j], buffer, strlen(buffer), 0);
-						}
-					}
-				}
-			}
-		}
-	}
+        buf[len] = 0;
 
-	return 0;
+        char messageWithName[BUF_SIZE + 32];
+        snprintf(messageWithName, sizeof(messageWithName), "%s: %s", clientNames[idx], buf);
+
+        EnterCriticalSection(&cs);
+        for (int i = 0; i < clientCount; i++) {
+            if (clients[i] != clientSock) {
+                send(clients[i], messageWithName, (int)strlen(messageWithName), 0);
+            }
+        }
+        LeaveCriticalSection(&cs);
+    }
+
+    EnterCriticalSection(&cs);
+    for (int i = 0; i < clientCount; i++) {
+        if (clients[i] == clientSock) {
+            for (int j = i; j < clientCount - 1; j++) {
+                clients[j] = clients[j + 1];
+                strncpy(clientNames[j], clientNames[j + 1], sizeof(clientNames[0]));
+            }
+            clientCount--;
+            break;
+        }
+    }
+    LeaveCriticalSection(&cs);
+
+    closesocket(clientSock);
+    printf("Client disconnected\n");
+    return 0;
 }
 
+int main() {
+    WSADATA wsa;
+    SOCKET listenSock, clientSock;
+    struct sockaddr_in serverAddr, clientAddr;
+    int clientAddrSize = sizeof(clientAddr);
 
+    InitializeCriticalSection(&cs);
 
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        printf("WSAStartup failed\n");
+        return 1;
+    }
 
+    listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
+        printf("socket failed: %d\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
 
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(27015);
 
+    if (bind(listenSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        printf("bind failed: %d\n", WSAGetLastError());
+        closesocket(listenSock);
+        WSACleanup();
+        return 1;
+    }
 
+    if (listen(listenSock, SOMAXCONN) == SOCKET_ERROR) {
+        printf("listen failed: %d\n", WSAGetLastError());
+        closesocket(listenSock);
+        WSACleanup();
+        return 1;
+    }
 
+    printf("Server started. Waiting for clients...\n");
 
+    while (1) {
+        clientSock = accept(listenSock, (struct sockaddr*)&clientAddr, &clientAddrSize);
+        if (clientSock == INVALID_SOCKET) {
+            printf("accept failed: %d\n", WSAGetLastError());
+            continue;
+        }
 
+        char nameBuf[32];
+        int nameLen = recv(clientSock, nameBuf, sizeof(nameBuf) - 1, 0);
+        if (nameLen <= 0) {
+            closesocket(clientSock);
+            continue;
+        }
+        nameBuf[nameLen] = 0;
 
+        EnterCriticalSection(&cs);
+        if (clientCount >= MAX_CLIENTS) {
+            LeaveCriticalSection(&cs);
+            printf("Max clients reached, rejecting\n");
+            closesocket(clientSock);
+            continue;
+        }
+        clients[clientCount] = clientSock;
+        strncpy(clientNames[clientCount], nameBuf, sizeof(clientNames[0]) - 1);
+        clientNames[clientCount][sizeof(clientNames[0]) - 1] = 0;
+        clientCount++;
+        LeaveCriticalSection(&cs);
 
+        printf("Client connected: %s:%d Name: %s\n",
+            inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port), nameBuf);
 
+        uintptr_t hThread = _beginthreadex(NULL, 0, client_thread, (void*)clientSock, 0, NULL);
+        if (hThread == 0) {
+            printf("Failed to create thread\n");
+            closesocket(clientSock);
+            EnterCriticalSection(&cs);
+            clientCount--;
+            LeaveCriticalSection(&cs);
+        }
+        CloseHandle((HANDLE)hThread);
+    }
 
+    DeleteCriticalSection(&cs);
+    closesocket(listenSock);
+    WSACleanup();
+    return 0;
+}
